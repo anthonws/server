@@ -5,7 +5,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from music_assistant_models.enums import MediaType
-from music_assistant_models.media_items import Track
+from music_assistant_models.media_items import Artist, Track
 
 from music_assistant.providers.apple_music.media import AppleMusicMediaManager
 from tests.common import use_real_create_task
@@ -42,6 +42,32 @@ def _library_song(library_id: str, *, catalog_id: str | None = None) -> dict[str
             "durationInMillis": 180000,
             "playParams": {"id": library_id},
         },
+        "relationships": relationships,
+    }
+
+
+def _catalog_artist(catalog_id: str) -> dict[str, Any]:
+    """Build a minimal catalog/artists response item."""
+    return {
+        "id": catalog_id,
+        "type": "artists",
+        "attributes": {
+            "name": f"Catalog Artist {catalog_id}",
+            "url": f"https://music.apple.com/artist/{catalog_id}",
+        },
+        "relationships": {},
+    }
+
+
+def _library_artist(library_id: str, *, catalog_id: str | None = None) -> dict[str, Any]:
+    """Build a me/library/artists response item, optionally carrying its catalog twin."""
+    relationships: dict[str, Any] = {}
+    if catalog_id is not None:
+        relationships["catalog"] = {"data": [_catalog_artist(catalog_id)]}
+    return {
+        "id": library_id,
+        "type": "library-artists",
+        "attributes": {"name": f"Library Artist {library_id}"},
         "relationships": relationships,
     }
 
@@ -142,3 +168,59 @@ async def test_get_track_passes_library_id_to_get_ratings(
 
     mock_api.get_ratings.assert_awaited_once_with(["i.AWPNG58CL3m51X"], MediaType.TRACK)
     assert result.favorite is True
+
+
+@pytest.mark.asyncio
+async def test_get_artist_uses_catalog_endpoint_for_catalog_id(
+    manager: AppleMusicMediaManager,
+    mock_api: MagicMock,
+) -> None:
+    """get_artist queries the catalog endpoint for a numeric artist id."""
+    mock_api.get_data.return_value = {"data": [_catalog_artist("987654321")]}
+
+    result = await manager.get_artist("987654321")
+
+    mock_api.get_data.assert_called_once_with(
+        "catalog/us/artists/987654321",
+        extend="editorialNotes",
+    )
+    assert isinstance(result, Artist)
+    assert result.item_id == "987654321"
+
+
+@pytest.mark.asyncio
+async def test_get_artist_uses_library_endpoint_for_library_id(
+    manager: AppleMusicMediaManager,
+    mock_api: MagicMock,
+) -> None:
+    """get_artist queries me/library/artists for a library id instead of 404ing."""
+    mock_api.get_data.return_value = {"data": [_library_artist("a.SomeLibraryArtist")]}
+
+    result = await manager.get_artist("a.SomeLibraryArtist")
+
+    mock_api.get_data.assert_called_once_with(
+        "me/library/artists/a.SomeLibraryArtist",
+        include="catalog",
+        extend="editorialNotes",
+    )
+    assert isinstance(result, Artist)
+    assert result.item_id == "a.SomeLibraryArtist"
+
+
+@pytest.mark.asyncio
+async def test_get_artist_library_id_prefers_catalog_twin(
+    manager: AppleMusicMediaManager,
+    mock_api: MagicMock,
+) -> None:
+    """The included catalog relationship collapses a library artist onto the catalog id."""
+
+    async def _get_data(_endpoint: str, **kwargs: Any) -> dict[str, Any]:
+        catalog_id = "987654321" if "catalog" in kwargs.get("include", "") else None
+        return {"data": [_library_artist("a.SomeLibraryArtist", catalog_id=catalog_id)]}
+
+    mock_api.get_data.side_effect = _get_data
+
+    result = await manager.get_artist("a.SomeLibraryArtist")
+
+    assert result.item_id == "987654321"
+    assert result.name == "Catalog Artist 987654321"

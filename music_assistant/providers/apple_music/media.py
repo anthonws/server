@@ -109,8 +109,12 @@ class AppleMusicMediaManager:
     @use_cache(cache_checksum=PARSED_ITEM_CACHE_CHECKSUM)
     async def get_artist(self, prov_artist_id: str) -> Artist:
         """Get full artist details by id."""
-        endpoint = f"catalog/{self.provider._storefront}/artists/{prov_artist_id}"
-        response = await self.api.get_data(endpoint, extend="editorialNotes")
+        if is_library_id(prov_artist_id):
+            endpoint = f"me/library/artists/{prov_artist_id}"
+            response = await self.api.get_data(endpoint, include="catalog", extend="editorialNotes")
+        else:
+            endpoint = f"catalog/{self.provider._storefront}/artists/{prov_artist_id}"
+            response = await self.api.get_data(endpoint, extend="editorialNotes")
         return cast("Artist", parse_artist(self.provider, response["data"][0]))
 
     @use_cache(cache_checksum=PARSED_ITEM_CACHE_CHECKSUM)
