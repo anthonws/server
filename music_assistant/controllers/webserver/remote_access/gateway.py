@@ -13,6 +13,7 @@ import base64
 import contextlib
 import json
 import logging
+import time
 from collections.abc import Awaitable, Callable, Coroutine
 from dataclasses import dataclass, field
 from functools import partial
@@ -43,6 +44,16 @@ LOGGER = logging.getLogger(f"{MASS_LOGGER_NAME}.remote_access")
 # Max concurrent proxied (image) fetches, so a burst of album-art requests stays bounded
 # instead of piling up local requests and the response bodies they buffer (see #4889).
 HTTP_PROXY_CONCURRENCY = 6
+
+# Minimum spacing between trickled ICE candidates, each of which costs one signaling
+# message. A multi-homed host gathers one host candidate per interface, and a machine
+# running containers has many: measured 9 candidates (5 of them docker bridges) inside
+# 80 ms on a normal Docker host. Sent unpaced that is a 9-message burst per session,
+# which the signaling server answers with "Rate limited. Try again in N seconds" and
+# doubles N on each attempt (60 -> 120 -> 240 -> 480), taking remote access down with
+# it. Spacing the sends keeps every candidate - connectivity is unchanged - and only
+# costs a slower gather.
+ICE_CANDIDATE_MIN_INTERVAL = 0.25
 
 # Preferred piece size when chunking an oversized message; each piece becomes a base64 frame
 # roughly a third larger, so the channel's negotiated limit can size it down further.
@@ -760,9 +771,21 @@ class WebRTCGateway:
     async def _forward_local_candidates(self, session: WebRTCSession) -> None:
         """Stream locally-gathered ICE candidates to the remote client (trickle ICE)."""
         # The iterator ends on gathering-complete or when the PC closes.
+        last_sent: float | None = None
         async for candidate in session.pc.ice_candidates():
             if session.session_id not in self.sessions or not self._signaling_ws:
                 return
+            # Space the sends so a multi-homed host does not hand the signaling server a
+            # burst it rate limits (see ICE_CANDIDATE_MIN_INTERVAL). The first candidate
+            # goes straight out, so a single-homed host is unaffected.
+            if last_sent is not None:
+                delay = last_sent + ICE_CANDIDATE_MIN_INTERVAL - time.monotonic()
+                if delay > 0:
+                    await asyncio.sleep(delay)
+                    # the session can be torn down while we wait
+                    if session.session_id not in self.sessions or not self._signaling_ws:
+                        return
+            last_sent = time.monotonic()
             await self._signaling_ws.send_json(
                 {
                     "type": "ice-candidate",

@@ -33,6 +33,7 @@ from music_assistant.controllers.webserver.remote_access import (
 from music_assistant.controllers.webserver.remote_access.gateway import (
     DATA_CHANNEL_CHUNK_SIZE,
     HTTP_PROXY_CONCURRENCY,
+    ICE_CANDIDATE_MIN_INTERVAL,
     WebRTCGateway,
     WebRTCSession,
     _is_usable_ice_url,
@@ -2024,3 +2025,91 @@ async def test_ma_api_channel_chunks_within_the_negotiated_limit(
         channel.close()
         await asyncio.wait_for(bridge, timeout=5)
         await _wait_for(lambda: "small-limit-session" not in gateway.sessions)
+
+
+def _fake_candidate(address: str) -> SimpleNamespace:
+    """Build a local ICE candidate in the shape aiolibdatachannel yields."""
+    return SimpleNamespace(
+        candidate=f"candidate:1 1 UDP 2122260223 {address} 54321 typ host", mid="0"
+    )
+
+
+def _gateway_with_paced_session(
+    cert_pems: tuple[str, str], candidates: list[SimpleNamespace]
+) -> tuple[Any, Any, list[float], list[str]]:
+    """Return (gateway, session, send_times, sent_addresses) wired for candidate forwarding."""
+    cert_pem, key_pem = cert_pems
+    gateway = WebRTCGateway(
+        http_session=Mock(), remote_id="TEST-REMOTE-ID", cert_pem=cert_pem, key_pem=key_pem
+    )
+
+    async def _iter_candidates() -> AsyncIterator[SimpleNamespace]:
+        for candidate in candidates:
+            yield candidate
+
+    session = SimpleNamespace(session_id="paced-session", pc=SimpleNamespace())
+    session.pc.ice_candidates = _iter_candidates
+    gateway.sessions[session.session_id] = cast("Any", session)
+
+    send_times: list[float] = []
+    sent: list[str] = []
+
+    async def _send_json(payload: dict[str, Any]) -> None:
+        send_times.append(asyncio.get_running_loop().time())
+        sent.append(payload["data"]["candidate"].split()[4])
+
+    gateway._signaling_ws = cast("Any", SimpleNamespace(send_json=_send_json))
+    return gateway, session, send_times, sent
+
+
+async def test_ice_candidates_are_paced_not_bursted(cert_pems: tuple[str, str]) -> None:
+    """
+    A multi-homed host must not hand the signaling server one message per interface at once.
+
+    Measured on a Docker host: 9 candidates gathered inside 80 ms. Unpaced that burst is
+    answered with "Rate limited. Try again in N seconds", and N doubles on every attempt
+    until remote access is unusable.
+    """
+    addresses = [f"172.2{i}.0.1" for i in range(5)] + ["192.168.25.240", "89.153.143.145"]
+    gateway, _, send_times, sent = _gateway_with_paced_session(
+        cert_pems, [_fake_candidate(a) for a in addresses]
+    )
+
+    await gateway._forward_local_candidates(cast("Any", gateway.sessions["paced-session"]))
+
+    assert sent == addresses, "every candidate must still be sent - connectivity is unchanged"
+    gaps = [send_times[i + 1] - send_times[i] for i in range(len(send_times) - 1)]
+    assert all(gap >= ICE_CANDIDATE_MIN_INTERVAL * 0.9 for gap in gaps), gaps
+
+
+async def test_first_ice_candidate_is_sent_immediately(cert_pems: tuple[str, str]) -> None:
+    """A single-homed host gathers one candidate and must not be slowed down at all."""
+    gateway, _, send_times, sent = _gateway_with_paced_session(
+        cert_pems, [_fake_candidate("192.168.25.240")]
+    )
+
+    started = asyncio.get_running_loop().time()
+    await gateway._forward_local_candidates(cast("Any", gateway.sessions["paced-session"]))
+
+    assert sent == ["192.168.25.240"]
+    assert send_times[0] - started < ICE_CANDIDATE_MIN_INTERVAL
+
+
+async def test_ice_pacing_stops_when_the_session_goes_away(cert_pems: tuple[str, str]) -> None:
+    """A session torn down while we are waiting out the interval must not be written to."""
+    gateway, session, _, sent = _gateway_with_paced_session(
+        cert_pems, [_fake_candidate("10.0.0.1"), _fake_candidate("10.0.0.2")]
+    )
+    real_sleep = asyncio.sleep
+
+    async def _drop_session_then_sleep(_delay: float) -> None:
+        gateway.sessions.pop(session.session_id, None)
+        await real_sleep(0)
+
+    with patch(
+        "music_assistant.controllers.webserver.remote_access.gateway.asyncio.sleep",
+        _drop_session_then_sleep,
+    ):
+        await gateway._forward_local_candidates(cast("Any", session))
+
+    assert sent == ["10.0.0.1"], "the second candidate must not go out after teardown"
