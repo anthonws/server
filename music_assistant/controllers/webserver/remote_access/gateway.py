@@ -957,16 +957,32 @@ class WebRTCGateway:
         local_ws = session.local_ws
         if local_ws is None:
             return
+        _why = "iterator ended"
         try:
             async for msg in local_ws:
                 if msg.type == aiohttp.WSMsgType.TEXT:
                     await self._send_chunked(channel, msg.data)
                 elif msg.type in (aiohttp.WSMsgType.ERROR, aiohttp.WSMsgType.CLOSED):
+                    _why = f"got {msg.type!r}"
                     break
         except asyncio.CancelledError:
+            _why = "cancelled"
             raise
-        except Exception:
+        except Exception as err:
+            _why = f"{type(err).__name__}: {err}"
             self.logger.exception("Error forwarding from local WebSocket")
+        finally:
+            self.logger.info(
+                "DIAG ma-api local WS ended for %s: %s (closed=%s code=%s exc=%r) "
+                "channel_open=%s buffered=%s",
+                session.session_id,
+                _why,
+                local_ws.closed,
+                local_ws.close_code,
+                local_ws.exception(),
+                getattr(channel, "is_open", "?"),
+                getattr(channel, "buffered_amount", "?"),
+            )
         # the local WS closed: the ma-api session is unusable, so tear it down instead of
         # leaving the client an open channel that silently drops messages
         self._schedule_close(session.session_id, "local ma-api websocket closed")
