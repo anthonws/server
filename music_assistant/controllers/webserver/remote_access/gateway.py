@@ -13,6 +13,8 @@ import base64
 import contextlib
 import json
 import logging
+import re
+import time
 from collections.abc import Awaitable, Callable, Coroutine
 from dataclasses import dataclass, field
 from functools import partial
@@ -52,6 +54,27 @@ LOCAL_WS_MAX_MSG_SIZE = 0  # 0 disables aiohttp's limit
 # Max concurrent proxied (image) fetches, so a burst of album-art requests stays bounded
 # instead of piling up local requests and the response bodies they buffer (see #4889).
 HTTP_PROXY_CONCURRENCY = 6
+
+# Minimum spacing between trickled ICE candidates, each of which costs one signaling
+# message. A multi-homed host gathers one host candidate per interface, and a machine
+# running containers has many: measured 9 candidates (5 of them docker bridges) inside
+# 80 ms on a normal Docker host. Sent unpaced that is a 9-message burst per session,
+# which the signaling server answers with "Rate limited. Try again in N seconds" and
+# doubles N on each attempt (60 -> 120 -> 240 -> 480), taking remote access down with
+# it. Spacing the sends keeps every candidate - connectivity is unchanged - and only
+# costs a slower gather.
+ICE_CANDIDATE_MIN_INTERVAL = 0.25
+
+# The signaling server answers an over-rate sender with "Rate limited. Try again in N
+# seconds", and rejects every message until that window passes. Continuing to trickle
+# candidates into it just burns messages that cannot arrive - and since the client then
+# never gets a usable candidate, it reconnects and trickles a fresh set, which is how a
+# single rate limit turns into a reconnect loop that outlives its own penalty. Parse the
+# window out and stop sending until it clears.
+SIGNALING_RATE_LIMIT = re.compile(r"rate limited.*?try again in (\d+) second", re.IGNORECASE)
+
+# Used when the server rate limits us without saying for how long.
+SIGNALING_RATE_LIMIT_FALLBACK = 60.0
 
 # Preferred piece size when chunking an oversized message; each piece becomes a base64 frame
 # roughly a third larger, so the channel's negotiated limit can size it down further.
@@ -206,6 +229,8 @@ class WebRTCGateway:
         self._reconnect_delay = 10  # Wait 10 seconds before reconnecting
         self._max_reconnect_delay = 300  # Max 5 minutes between reconnects
         self._current_reconnect_delay = 10
+        # monotonic deadline before which the server rejects everything we send
+        self._signaling_suspended_until = 0.0
         self._run_task: asyncio.Task[None] | None = None
         self._is_connected = False
         self._connecting = False
@@ -432,8 +457,11 @@ class WebRTCGateway:
             self._is_connected = True
             self.logger.info("Registered with signaling server")
         elif msg_type == "error":
-            error_msg = message.get("error") or message.get("message", "Unknown error")
-            self.logger.error("Signaling server error: %s", error_msg)
+            error_msg = str(message.get("error") or message.get("message", "Unknown error"))
+            if (match := SIGNALING_RATE_LIMIT.search(error_msg)) is not None:
+                self._suspend_signaling(float(match.group(1)), error_msg)
+            else:
+                self.logger.error("Signaling server error: %s", error_msg)
         elif msg_type == "client-connected":
             session_id = message.get("sessionId")
             if session_id:
@@ -766,12 +794,52 @@ class WebRTCGateway:
                 self._schedule_close(session.session_id)
                 return
 
+    def _suspend_signaling(self, retry_after: float, error_msg: str) -> None:
+        """
+        Stop trickling ICE candidates until a rate limit window passes.
+
+        :param retry_after: Seconds the server told us to wait.
+        :param error_msg: The server's message, logged once per window.
+        """
+        now = time.monotonic()
+        # a burst is rejected message by message, so the window is usually already open by
+        # the time the second rejection lands; extend it but do not announce it again
+        already_suspended = now < self._signaling_suspended_until
+        self._signaling_suspended_until = max(self._signaling_suspended_until, now + retry_after)
+        if already_suspended:
+            self.logger.debug("Still rate limited by the signaling server: %s", error_msg)
+            return
+        self.logger.error(
+            "Signaling server error: %s - pausing ICE candidate sends for %.0fs",
+            error_msg,
+            retry_after,
+        )
+
     async def _forward_local_candidates(self, session: WebRTCSession) -> None:
         """Stream locally-gathered ICE candidates to the remote client (trickle ICE)."""
         # The iterator ends on gathering-complete or when the PC closes.
+        last_sent: float | None = None
         async for candidate in session.pc.ice_candidates():
             if session.session_id not in self.sessions or not self._signaling_ws:
                 return
+            if time.monotonic() < self._signaling_suspended_until:
+                # the server is rejecting everything; sending anyway cannot reach the peer
+                self.logger.debug(
+                    "Dropping ICE candidates for session %s while rate limited",
+                    session.session_id,
+                )
+                return
+            # Space the sends so a multi-homed host does not hand the signaling server a
+            # burst it rate limits (see ICE_CANDIDATE_MIN_INTERVAL). The first candidate
+            # goes straight out, so a single-homed host is unaffected.
+            if last_sent is not None:
+                delay = last_sent + ICE_CANDIDATE_MIN_INTERVAL - time.monotonic()
+                if delay > 0:
+                    await asyncio.sleep(delay)
+                    # the session can be torn down while we wait
+                    if session.session_id not in self.sessions or not self._signaling_ws:
+                        return
+            last_sent = time.monotonic()
             await self._signaling_ws.send_json(
                 {
                     "type": "ice-candidate",

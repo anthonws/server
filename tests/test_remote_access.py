@@ -33,6 +33,7 @@ from music_assistant.controllers.webserver.remote_access import (
 from music_assistant.controllers.webserver.remote_access.gateway import (
     DATA_CHANNEL_CHUNK_SIZE,
     HTTP_PROXY_CONCURRENCY,
+    ICE_CANDIDATE_MIN_INTERVAL,
     LOCAL_WS_MAX_MSG_SIZE,
     WebRTCGateway,
     WebRTCSession,
@@ -2052,3 +2053,165 @@ async def test_local_bridge_dial_disables_the_message_size_cap(
         assert LOCAL_WS_MAX_MSG_SIZE == 0, "0 is what disables aiohttp's limit"
     finally:
         await gateway._close_session("cap-session")
+
+
+def _fake_candidate(address: str) -> SimpleNamespace:
+    """Build a local ICE candidate in the shape aiolibdatachannel yields."""
+    return SimpleNamespace(
+        candidate=f"candidate:1 1 UDP 2122260223 {address} 54321 typ host", mid="0"
+    )
+
+
+def _gateway_with_paced_session(
+    cert_pems: tuple[str, str], candidates: list[SimpleNamespace]
+) -> tuple[Any, Any, list[float], list[str]]:
+    """Return (gateway, session, send_times, sent_addresses) wired for candidate forwarding."""
+    cert_pem, key_pem = cert_pems
+    gateway = WebRTCGateway(
+        http_session=Mock(), remote_id="TEST-REMOTE-ID", cert_pem=cert_pem, key_pem=key_pem
+    )
+
+    async def _iter_candidates() -> AsyncIterator[SimpleNamespace]:
+        for candidate in candidates:
+            yield candidate
+
+    session = SimpleNamespace(session_id="paced-session", pc=SimpleNamespace())
+    session.pc.ice_candidates = _iter_candidates
+    gateway.sessions[session.session_id] = cast("Any", session)
+
+    send_times: list[float] = []
+    sent: list[str] = []
+
+    async def _send_json(payload: dict[str, Any]) -> None:
+        send_times.append(asyncio.get_running_loop().time())
+        sent.append(payload["data"]["candidate"].split()[4])
+
+    gateway._signaling_ws = cast("Any", SimpleNamespace(send_json=_send_json))
+    return gateway, session, send_times, sent
+
+
+async def test_ice_candidates_are_paced_not_bursted(cert_pems: tuple[str, str]) -> None:
+    """
+    A multi-homed host must not hand the signaling server one message per interface at once.
+
+    Measured on a Docker host: 9 candidates gathered inside 80 ms. Unpaced that burst is
+    answered with "Rate limited. Try again in N seconds", and N doubles on every attempt
+    until remote access is unusable.
+    """
+    addresses = [f"172.2{i}.0.1" for i in range(5)] + ["192.168.25.240", "89.153.143.145"]
+    gateway, _, send_times, sent = _gateway_with_paced_session(
+        cert_pems, [_fake_candidate(a) for a in addresses]
+    )
+
+    await gateway._forward_local_candidates(cast("Any", gateway.sessions["paced-session"]))
+
+    assert sent == addresses, "every candidate must still be sent - connectivity is unchanged"
+    gaps = [send_times[i + 1] - send_times[i] for i in range(len(send_times) - 1)]
+    assert all(gap >= ICE_CANDIDATE_MIN_INTERVAL * 0.9 for gap in gaps), gaps
+
+
+async def test_first_ice_candidate_is_sent_immediately(cert_pems: tuple[str, str]) -> None:
+    """A single-homed host gathers one candidate and must not be slowed down at all."""
+    gateway, _, send_times, sent = _gateway_with_paced_session(
+        cert_pems, [_fake_candidate("192.168.25.240")]
+    )
+
+    started = asyncio.get_running_loop().time()
+    await gateway._forward_local_candidates(cast("Any", gateway.sessions["paced-session"]))
+
+    assert sent == ["192.168.25.240"]
+    assert send_times[0] - started < ICE_CANDIDATE_MIN_INTERVAL
+
+
+async def test_ice_pacing_stops_when_the_session_goes_away(cert_pems: tuple[str, str]) -> None:
+    """A session torn down while we are waiting out the interval must not be written to."""
+    gateway, session, _, sent = _gateway_with_paced_session(
+        cert_pems, [_fake_candidate("10.0.0.1"), _fake_candidate("10.0.0.2")]
+    )
+    real_sleep = asyncio.sleep
+
+    async def _drop_session_then_sleep(_delay: float) -> None:
+        gateway.sessions.pop(session.session_id, None)
+        await real_sleep(0)
+
+    with patch(
+        "music_assistant.controllers.webserver.remote_access.gateway.asyncio.sleep",
+        _drop_session_then_sleep,
+    ):
+        await gateway._forward_local_candidates(cast("Any", session))
+
+    assert sent == ["10.0.0.1"], "the second candidate must not go out after teardown"
+
+
+async def test_rate_limit_stops_further_ice_candidates(cert_pems: tuple[str, str]) -> None:
+    """
+    A rate limit must stop the trickle, not be logged and ignored.
+
+    While the window is open the server rejects everything, so candidates sent anyway
+    cannot reach the peer. The client then never gets a usable candidate, reconnects,
+    and trickles a fresh set - which is how one rate limit becomes a reconnect loop.
+    """
+    gateway, _, _, sent = _gateway_with_paced_session(
+        cert_pems, [_fake_candidate("10.0.0.1"), _fake_candidate("10.0.0.2")]
+    )
+
+    await gateway._handle_signaling_message(
+        {"type": "error", "error": "Rate limited. Try again in 240 seconds."}
+    )
+    await gateway._forward_local_candidates(cast("Any", gateway.sessions["paced-session"]))
+
+    assert sent == [], "nothing may be sent into an open rate limit window"
+
+
+async def test_rate_limit_window_expires(cert_pems: tuple[str, str]) -> None:
+    """Once the window passes the trickle resumes - the pause must not be permanent."""
+    gateway, _, _, sent = _gateway_with_paced_session(cert_pems, [_fake_candidate("10.0.0.1")])
+
+    await gateway._handle_signaling_message(
+        {"type": "error", "error": "Rate limited. Try again in 240 seconds."}
+    )
+    # pretend the window has passed
+    gateway._signaling_suspended_until = 0.0
+    await gateway._forward_local_candidates(cast("Any", gateway.sessions["paced-session"]))
+
+    assert sent == ["10.0.0.1"]
+
+
+async def test_repeat_rate_limits_in_one_burst_log_once(cert_pems: tuple[str, str]) -> None:
+    """The rest of a burst already in flight must not re-log or extend the window."""
+    cert_pem, key_pem = cert_pems
+    gateway = WebRTCGateway(
+        http_session=Mock(), remote_id="TEST-REMOTE-ID", cert_pem=cert_pem, key_pem=key_pem
+    )
+    errors: list[str] = []
+
+    def _noop(*_args: Any, **_kwargs: Any) -> None:
+        return None
+
+    gateway.logger = cast(
+        "Any",
+        SimpleNamespace(
+            error=lambda msg, *a: errors.append(str(msg) % a if a else str(msg)),
+            debug=_noop,
+            warning=_noop,
+            info=_noop,
+        ),
+    )
+
+    for _ in range(9):
+        await gateway._handle_signaling_message(
+            {"type": "error", "error": "Rate limited. Try again in 240 seconds."}
+        )
+
+    assert len(errors) == 1, f"expected one error line per window, got {len(errors)}"
+
+
+async def test_non_rate_limit_errors_do_not_suspend(cert_pems: tuple[str, str]) -> None:
+    """Only a rate limit pauses the trickle; other errors must not."""
+    gateway, _, _, sent = _gateway_with_paced_session(cert_pems, [_fake_candidate("10.0.0.1")])
+
+    await gateway._handle_signaling_message({"type": "error", "error": "Unknown session"})
+    await gateway._forward_local_candidates(cast("Any", gateway.sessions["paced-session"]))
+
+    assert gateway._signaling_suspended_until == 0.0
+    assert sent == ["10.0.0.1"]
