@@ -2113,3 +2113,77 @@ async def test_ice_pacing_stops_when_the_session_goes_away(cert_pems: tuple[str,
         await gateway._forward_local_candidates(cast("Any", session))
 
     assert sent == ["10.0.0.1"], "the second candidate must not go out after teardown"
+
+
+async def test_rate_limit_stops_further_ice_candidates(cert_pems: tuple[str, str]) -> None:
+    """
+    A rate limit must stop the trickle, not be logged and ignored.
+
+    While the window is open the server rejects everything, so candidates sent anyway
+    cannot reach the peer. The client then never gets a usable candidate, reconnects,
+    and trickles a fresh set - which is how one rate limit becomes a reconnect loop.
+    """
+    gateway, _, _, sent = _gateway_with_paced_session(
+        cert_pems, [_fake_candidate("10.0.0.1"), _fake_candidate("10.0.0.2")]
+    )
+
+    await gateway._handle_signaling_message(
+        {"type": "error", "error": "Rate limited. Try again in 240 seconds."}
+    )
+    await gateway._forward_local_candidates(cast("Any", gateway.sessions["paced-session"]))
+
+    assert sent == [], "nothing may be sent into an open rate limit window"
+
+
+async def test_rate_limit_window_expires(cert_pems: tuple[str, str]) -> None:
+    """Once the window passes the trickle resumes - the pause must not be permanent."""
+    gateway, _, _, sent = _gateway_with_paced_session(cert_pems, [_fake_candidate("10.0.0.1")])
+
+    await gateway._handle_signaling_message(
+        {"type": "error", "error": "Rate limited. Try again in 240 seconds."}
+    )
+    # pretend the window has passed
+    gateway._signaling_suspended_until = 0.0
+    await gateway._forward_local_candidates(cast("Any", gateway.sessions["paced-session"]))
+
+    assert sent == ["10.0.0.1"]
+
+
+async def test_repeat_rate_limits_in_one_burst_log_once(cert_pems: tuple[str, str]) -> None:
+    """The rest of a burst already in flight must not re-log or extend the window."""
+    cert_pem, key_pem = cert_pems
+    gateway = WebRTCGateway(
+        http_session=Mock(), remote_id="TEST-REMOTE-ID", cert_pem=cert_pem, key_pem=key_pem
+    )
+    errors: list[str] = []
+
+    def _noop(*_args: Any, **_kwargs: Any) -> None:
+        return None
+
+    gateway.logger = cast(
+        "Any",
+        SimpleNamespace(
+            error=lambda msg, *a: errors.append(str(msg) % a if a else str(msg)),
+            debug=_noop,
+            warning=_noop,
+            info=_noop,
+        ),
+    )
+
+    for _ in range(9):
+        await gateway._handle_signaling_message(
+            {"type": "error", "error": "Rate limited. Try again in 240 seconds."}
+        )
+
+    assert len(errors) == 1, f"expected one error line per window, got {len(errors)}"
+
+
+async def test_non_rate_limit_errors_do_not_suspend(cert_pems: tuple[str, str]) -> None:
+    """Only a rate limit pauses the trickle; other errors must not."""
+    gateway, _, _, sent = _gateway_with_paced_session(cert_pems, [_fake_candidate("10.0.0.1")])
+
+    await gateway._handle_signaling_message({"type": "error", "error": "Unknown session"})
+    await gateway._forward_local_candidates(cast("Any", gateway.sessions["paced-session"]))
+
+    assert gateway._signaling_suspended_until == 0.0
+    assert sent == ["10.0.0.1"]
