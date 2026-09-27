@@ -727,6 +727,13 @@ class WebRTCGateway:
         if len(data) <= min(DATA_CHANNEL_CHUNK_SIZE, limit):
             await self._send_on_channel(channel, text, timeout=timeout)
             return
+        self.logger.info(
+            "DIAG chunking %d bytes (limit=%d) into ~%d frames",
+            len(data),
+            limit,
+            (len(data) + DATA_CHANNEL_CHUNK_SIZE - 1) // DATA_CHANNEL_CHUNK_SIZE,
+        )
+        _chunk_started = time.monotonic()
 
         # Oversized messages are split into base64 frames the client reassembles by group id
         # (base64 keeps each frame's size predictable regardless of JSON escaping / unicode).
@@ -736,11 +743,18 @@ class WebRTCGateway:
         self._chunk_group_seq += 1
         group_id = self._chunk_group_seq
         count = (len(data) + piece_size - 1) // piece_size
+        self.logger.info("DIAG group %d: %d frames of %d bytes", group_id, count, piece_size)
         for seq in range(count):
             # a send onto a channel that is no longer open returns without suspending, so
             # without this the loop would frame and discard every remaining piece without
             # ever yielding
             if not channel.is_open:
+                self.logger.info(
+                    "DIAG channel closed mid-chunk at %d/%d after %.2fs",
+                    seq,
+                    count,
+                    time.monotonic() - _chunk_started,
+                )
                 return
             piece = data[seq * piece_size : (seq + 1) * piece_size]
             await self._send_on_channel(
@@ -781,8 +795,12 @@ class WebRTCGateway:
     async def _monitor_state(self, session: WebRTCSession) -> None:
         """Close the session when its PeerConnection reports a failed state."""
         async for event in session.pc.events():
+            if isinstance(event, StateChangeEvent):
+                self.logger.info(
+                    "DIAG pc state %s for session %s", event.state, session.session_id
+                )
             if isinstance(event, StateChangeEvent) and event.state == RTCState.FAILED:
-                self._schedule_close(session.session_id)
+                self._schedule_close(session.session_id, "peer connection FAILED")
                 return
 
     def _suspend_signaling(self, retry_after: float, error_msg: str) -> None:
@@ -951,7 +969,7 @@ class WebRTCGateway:
             self.logger.exception("Error forwarding from local WebSocket")
         # the local WS closed: the ma-api session is unusable, so tear it down instead of
         # leaving the client an open channel that silently drops messages
-        self._schedule_close(session.session_id)
+        self._schedule_close(session.session_id, "local ma-api websocket closed")
 
     async def _bridge_websocket(
         self,
@@ -1103,12 +1121,13 @@ class WebRTCGateway:
             self.logger.debug("Skipping ICE server urls unusable by libjuice: %s", skipped)
         return ice_servers
 
-    def _schedule_close(self, session_id: str) -> None:
+    def _schedule_close(self, session_id: str, reason: str = "unspecified") -> None:
         """Schedule session teardown on a gateway-owned task."""
         # Run outside the PC-owned pump that triggered it so pc.aclose() (which the pump
         # is awaited by) does not deadlock on itself
         if session_id not in self.sessions:
             return
+        self.logger.info("DIAG closing session %s: %s", session_id, reason)
         task = asyncio.create_task(self._close_session(session_id))
         self._background_tasks.add(task)
         task.add_done_callback(self._background_tasks.discard)
