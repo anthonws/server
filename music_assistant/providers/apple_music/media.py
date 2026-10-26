@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING, Any, cast
 
 from music_assistant_models.enums import ExternalID, MediaType
 from music_assistant_models.errors import MediaNotFoundError, MusicAssistantError
@@ -39,7 +39,66 @@ from .parsers import (
 )
 
 if TYPE_CHECKING:
+    from collections.abc import Iterable
+
     from .provider import AppleMusicProvider
+
+
+async def get_purchases_still_sold(
+    provider: AppleMusicProvider, items: Iterable[dict[str, Any]]
+) -> set[str]:
+    """
+    Return the ids of the purchases among these library items that Apple still sells.
+
+    A purchase has a ``purchasedId`` but no ``catalogId``. That ``purchasedId`` is a catalog
+    adam ID, and whether it still resolves decides whether the license server serves the
+    track: measured over 24 purchases, 13 resolved and were licensed, 11 returned 404 and
+    were refused. A failed lookup leaves the purchases hidden.
+
+    :param provider: The Apple Music provider.
+    :param items: Raw library song items, as listed by the Apple Music API.
+    """
+    purchases = {
+        item["id"]: purchased_id
+        for item in items
+        if item and item.get("id") and (purchased_id := _purchased_id(item))
+    }
+    if not purchases:
+        return set()
+    try:
+        sold = await provider.media_manager.get_catalog_song_ids(
+            ",".join(sorted(set(purchases.values())))
+        )
+    except MusicAssistantError as err:
+        provider.logger.warning(
+            "Unable to check whether %s purchased songs are still sold: %s", len(purchases), err
+        )
+        return set()
+    return {item_id for item_id, purchased_id in purchases.items() if purchased_id in sold}
+
+
+def promote_purchase(provider: AppleMusicProvider, track: Track) -> None:
+    """
+    Mark a purchase that Apple still sells as available.
+
+    ``_is_available()`` reports every purchase unavailable, since its metadata cannot tell a
+    licensable one from a revoked one. Only ever promotes, so it never overrides that
+    judgement on weaker evidence.
+
+    :param provider: The provider whose mappings to promote.
+    :param track: The parsed track of a purchase from ``get_purchases_still_sold``.
+    """
+    for mapping in track.provider_mappings:
+        if mapping.provider_instance == provider.instance_id:
+            mapping.available = True
+
+
+def _purchased_id(item: dict[str, Any]) -> str | None:
+    """Return the purchase adam ID of a library item, or None if it is not a purchase."""
+    play_params = (item.get("attributes") or {}).get("playParams") or {}
+    if play_params.get("catalogId"):
+        return None
+    return cast("str | None", play_params.get("purchasedId"))
 
 
 class AppleMusicMediaManager:
@@ -157,6 +216,23 @@ class AppleMusicMediaManager:
         endpoint = f"catalog/{self.provider._storefront}/songs/{prov_track_id}"
         response = await self.api.get_data(endpoint, include="artists,albums")
         return parse_track(self.provider, response["data"][0])
+
+    # a failed lookup raises out of here and so is never cached
+    @use_cache(3600 * 24 * 7, cache_checksum=PARSED_ITEM_CACHE_CHECKSUM)
+    async def get_catalog_song_ids(self, adam_ids: str) -> list[str]:
+        """
+        Return which of these catalog song ids still exist in the storefront.
+
+        :param adam_ids: Comma separated catalog song ids.
+        """
+        try:
+            response = await self.api.get_data(
+                f"catalog/{self.provider._storefront}/songs", ids=adam_ids
+            )
+        except MediaNotFoundError:
+            # a 404 means Apple recognised none of them, which is an answer, not a failure
+            return []
+        return [item["id"] for item in response.get("data", [])]
 
     async def get_playlist(
         self,
@@ -300,10 +376,13 @@ class AppleMusicMediaManager:
             endpoint = f"catalog/{self.provider._storefront}/albums/{prov_album_id}/tracks"
             response = await self.api.get_data(endpoint, include="artists")
         tracks = []
+        still_sold = await get_purchases_still_sold(self.provider, response["data"])
         for track_obj in response["data"]:
             if "id" not in track_obj:
                 continue
             track = parse_track(self.provider, track_obj)
+            if track_obj["id"] in still_sold:
+                promote_purchase(self.provider, track)
             # the listing omits the album relation, so parse_track would make the album name
             # stand in as its id; callers attach the album they asked for instead, which saves
             # fetching it again for every album a library sync imports
@@ -335,9 +414,12 @@ class AppleMusicMediaManager:
         )
         if not response or "data" not in response:
             return result
+        still_sold = await get_purchases_still_sold(self.provider, response["data"])
         for index, track in enumerate(response["data"]):
             if track and track["id"]:
                 parsed_track = parse_track(self.provider, track)
+                if track["id"] in still_sold:
+                    promote_purchase(self.provider, parsed_track)
                 parsed_track.position = offset + index + 1
                 result.append(parsed_track)
         return result

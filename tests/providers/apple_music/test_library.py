@@ -7,7 +7,10 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from music_assistant_models.enums import MediaType
-from music_assistant_models.errors import MediaNotFoundError, MusicAssistantError
+from music_assistant_models.errors import (
+    MusicAssistantError,
+    RetriesExhausted,
+)
 from music_assistant_models.media_items import (
     Album,
     Artist,
@@ -1131,73 +1134,100 @@ async def test_track_sync_reads_catalog_relationships_from_listing() -> None:
     assert all(not mapping.available for mapping in withdrawn_track.provider_mappings)
 
 
-async def test_resolve_purchased_ids_returns_only_what_apple_still_sells() -> None:
-    """A purchasedId that still resolves in the catalog is one Apple will license."""
-    provider = MagicMock()
-    provider._storefront = "pt"
-    provider.instance_id = "apple_music--test"
-    provider.logger = MagicMock()
-    get_data = AsyncMock(
-        return_value={"data": [{"id": "397010985"}]}  # the U2 id is simply absent
-    )
-    provider.api_client.get_data = get_data
-    manager = AppleMusicLibraryManager(provider)
-
-    result = await manager._resolve_purchased_ids({"397010985", "915794195"})
-
-    assert result == {"397010985"}
-    assert get_data.await_args is not None
-    assert get_data.await_args.args[0] == "catalog/pt/songs"
-    assert get_data.await_args.kwargs["ids"] == "397010985,915794195"
-
-
-async def test_resolve_purchased_ids_treats_a_404_as_none_still_sold() -> None:
-    """Apple answers 404 when it recognises none of them; that is an answer, not a failure."""
-    provider = MagicMock()
-    provider._storefront = "pt"
-    provider.logger = MagicMock()
-    provider.api_client.get_data = AsyncMock(side_effect=MediaNotFoundError("not found"))
-    manager = AppleMusicLibraryManager(provider)
-
-    assert await manager._resolve_purchased_ids({"915794195"}) == set()
-
-
-async def test_resolve_purchased_ids_makes_no_call_when_there_are_no_purchases() -> None:
-    """The common case is a library with no purchases at all; it must cost nothing."""
-    provider = MagicMock()
-    provider.logger = MagicMock()
-    get_data = AsyncMock()
-    provider.api_client.get_data = get_data
-    manager = AppleMusicLibraryManager(provider)
-
-    assert await manager._resolve_purchased_ids(set()) == set()
-    get_data.assert_not_awaited()
-
-
-def test_promote_purchase_only_ever_promotes() -> None:
-    """Promotion must not contradict a judgement the parser made on stronger evidence."""
-    provider = MagicMock()
-    provider.instance_id = "apple_music--test"
-    provider.logger = MagicMock()
-    provider.api_client = MagicMock()
-    manager = AppleMusicLibraryManager(provider)
-
-    track = Track(
-        item_id="i.librarysong",
-        provider="apple_music",
-        name="Library Song",
-        provider_mappings={
-            ProviderMapping(
-                item_id="i.librarysong",
-                provider_domain="apple_music",
-                provider_instance="apple_music--test",
-                available=False,
-            )
+def _purchase(idx: int, purchased_id: str, *, with_album: bool) -> dict[str, Any]:
+    """Build a purchased library song: a purchasedId and no catalogId."""
+    item: dict[str, Any] = {
+        "id": f"i.{idx}",
+        "type": "library-songs",
+        "attributes": {
+            "name": f"Track {idx}",
+            "albumName": f"Album {idx}",
+            "playParams": {"id": f"i.{idx}", "purchasedId": purchased_id},
         },
+    }
+    if with_album:
+        item["relationships"] = {
+            "albums": {
+                "data": [
+                    {
+                        "id": f"l.album{idx}",
+                        "type": "library-albums",
+                        "attributes": {"name": f"Album {idx}"},
+                    }
+                ]
+            }
+        }
+    return item
+
+
+def _make_purchase_sync_manager(
+    items: list[dict[str, Any]],
+) -> tuple[AppleMusicLibraryManager, MagicMock]:
+    """Build a manager syncing these library-only songs; the detail fetch adds the album."""
+    provider = MagicMock()
+    provider.domain = "apple_music"
+    provider.instance_id = "apple_music--test"
+    provider._storefront = "pt"
+    by_id = {item["id"]: item for item in items}
+
+    async def _iter(*_args: Any, **_kwargs: Any) -> Any:
+        for item in items:
+            yield item
+
+    async def _get_data(_endpoint: str, **kwargs: Any) -> dict[str, Any]:
+        details = []
+        for item_id in kwargs["ids"].split(","):
+            idx = int(item_id.split(".")[1])
+            purchased_id = by_id[item_id]["attributes"]["playParams"]["purchasedId"]
+            details.append(_purchase(idx, purchased_id, with_album=True))
+        return {"data": details}
+
+    provider.api_client.iter_all_items = _iter
+    provider.api_client.get_data = AsyncMock(side_effect=_get_data)
+    provider.api_client.get_ratings = AsyncMock(return_value={})
+    return AppleMusicLibraryManager(provider), provider
+
+
+@pytest.mark.asyncio
+async def test_library_sync_promotes_purchases_apple_still_sells() -> None:
+    """A purchase that still resolves in the catalog syncs available, on both enrich paths."""
+    items = [
+        _purchase(1, "397010985", with_album=True),  # still sold, listing row kept as is
+        _purchase(2, "915794195", with_album=True),  # revoked (the 2014 U2 giveaway)
+        _purchase(3, "1111111111", with_album=False),  # still sold, replaced by the detail fetch
+    ]
+    manager, provider = _make_purchase_sync_manager(items)
+    get_catalog_song_ids = AsyncMock(return_value=["397010985", "1111111111"])
+    provider.media_manager.get_catalog_song_ids = get_catalog_song_ids
+
+    tracks = {track.item_id: track async for track in manager.get_library_tracks()}
+
+    get_catalog_song_ids.assert_awaited_once_with("1111111111,397010985,915794195")
+    available = {
+        item_id: [mapping.available for mapping in track.provider_mappings]
+        for item_id, track in tracks.items()
+    }
+    assert available == {"i.1": [True], "i.2": [False], "i.3": [True]}
+    # i.3 really went through the detail path
+    assert tracks["i.3"].album is not None
+    assert tracks["i.3"].album.item_id == "l.album3"
+
+
+@pytest.mark.asyncio
+async def test_library_sync_keeps_purchases_hidden_when_the_lookup_is_throttled() -> None:
+    """A throttled purchase lookup hides the purchases and lets the rest of the sync finish."""
+    items = [
+        _purchase(1, "397010985", with_album=True),
+        _library_song(2, catalog_id=None),  # an upload, available on its own
+    ]
+    manager, provider = _make_purchase_sync_manager(items)
+    provider.api_client.get_data = AsyncMock(return_value={"data": []})
+    provider.media_manager.get_catalog_song_ids = AsyncMock(
+        side_effect=RetriesExhausted("throttled")
     )
 
-    manager._promote_purchase(track, still_on_sale=False)
-    assert all(m.available is False for m in track.provider_mappings)
+    tracks = {track.item_id: track async for track in manager.get_library_tracks()}
 
-    manager._promote_purchase(track, still_on_sale=True)
-    assert all(m.available is True for m in track.provider_mappings)
+    assert [m.available for m in tracks["i.1"].provider_mappings] == [False]
+    assert [m.available for m in tracks["i.2"].provider_mappings] == [True]
+    provider.logger.warning.assert_called()

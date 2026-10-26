@@ -13,6 +13,7 @@ from music_assistant_models.media_items import Track
 from music_assistant.controllers.cache import use_cache
 
 from .helpers.utils import is_catalog_id, is_library_id, translate_media_type_to_apple_type
+from .media import get_purchases_still_sold, promote_purchase
 from .parsers import parse_album, parse_artist, parse_playlist, parse_track
 
 if TYPE_CHECKING:
@@ -439,12 +440,7 @@ class AppleMusicLibraryManager:
             (item, parse_track(self.provider, item, rating_response.get(item["id"])))
             for item in library_only_items
         ]
-        purchased_ids = {
-            item["id"]: purchased_id
-            for item in library_only_items
-            if (purchased_id := self._purchased_id(item))
-        }
-        still_sold = await self._resolve_purchased_ids(set(purchased_ids.values()))
+        still_sold = await get_purchases_still_sold(self.provider, library_only_items)
         details = await self._fetch_library_song_details(
             [
                 item["id"]
@@ -453,9 +449,9 @@ class AppleMusicLibraryManager:
             ]
         )
         for item, parsed_track in parsed_tracks:
-            still_on_sale = purchased_ids.get(item["id"]) in still_sold
             if (detail := details.get(item["id"])) is None:
-                self._promote_purchase(parsed_track, still_on_sale)
+                if item["id"] in still_sold:
+                    promote_purchase(self.provider, parsed_track)
                 yield parsed_track
                 continue
             track = self._apply_album_detail(
@@ -464,59 +460,9 @@ class AppleMusicLibraryManager:
             # the detail fetch replaces the track wholesale, so re-apply dateAdded from the
             # listing row, which is the object that actually owns it
             _set_date_added(track, item)
-            self._promote_purchase(track, still_on_sale)
+            if item["id"] in still_sold:
+                promote_purchase(self.provider, track)
             yield track
-
-    async def _resolve_purchased_ids(self, purchased_ids: set[str]) -> set[str]:
-        """
-        Return the purchase adam IDs Apple still sells.
-
-        A purchase carries no ``catalogId`` and no catalog relationship, so
-        ``_is_available()`` can only report it unavailable. Its ``purchasedId`` is a
-        catalog adam ID all the same, and whether that still resolves is exactly what
-        decides whether the license server will serve it. Measured over 24 purchases:
-        13 resolved and all 13 were licensed, 11 returned 404 and all 11 were refused.
-
-        One request covers a whole sync window, which ``_TRACK_SYNC_WINDOW`` keeps
-        well under the catalog's limit of ids per request.
-
-        :param purchased_ids: The ``purchasedId`` values seen in this window.
-        """
-        if not purchased_ids:
-            return set()
-        endpoint = f"catalog/{self.provider._storefront}/songs"
-        try:
-            response = await self.api.get_data(endpoint, ids=",".join(sorted(purchased_ids)))
-        except MediaNotFoundError:
-            # Apple answers 404 when it recognises none of them, which is a valid
-            # outcome rather than an error: every one of these is no longer for sale.
-            return set()
-        return {item["id"] for item in response.get("data", [])}
-
-    @staticmethod
-    def _purchased_id(item: dict[str, Any]) -> str | None:
-        """Return the purchase adam ID for a library item, or None if it is not a purchase."""
-        play_params = (item.get("attributes") or {}).get("playParams") or {}
-        if play_params.get("catalogId"):
-            return None
-        return cast("str | None", play_params.get("purchasedId"))
-
-    def _promote_purchase(self, track: Track, still_on_sale: bool) -> None:
-        """
-        Mark a purchase available when Apple still sells it.
-
-        ``_is_available()`` defaults every purchase to unavailable because metadata
-        alone cannot tell a licensable one from a revoked one. Only promote; never
-        demote, so this cannot contradict a judgement the parser already made on
-        stronger evidence.
-
-        :param still_on_sale: Whether this track's ``purchasedId`` resolved in the catalog.
-        """
-        if not still_on_sale:
-            return
-        for mapping in track.provider_mappings:
-            if mapping.provider_instance == self.provider.instance_id:
-                mapping.available = True
 
     async def _fetch_library_song_details(
         self, library_ids: list[str]

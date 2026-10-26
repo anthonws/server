@@ -436,11 +436,12 @@ def _is_available(attributes: dict[str, Any]) -> bool:
     purchases, and the 2014 U2 giveaway).
 
     A purchase is reported unavailable here because nothing in the metadata says
-    whether Apple still sells it, and that is what decides it. The library sync
-    resolves the ``purchasedId`` against the catalog and promotes the ones that still
-    exist - see ``AppleMusicLibraryManager._resolve_purchased_ids``. This stays the
-    conservative default, so a failed or skipped lookup hides a playable track rather
-    than offering an unplayable one.
+    whether Apple still sells it, and that is what decides it. Everything that parses
+    library songs (library sync, library album and playlist tracks) resolves
+    the ``purchasedId`` against the catalog and promotes the ones that still exist - see
+    ``media.get_purchases_still_sold``. This stays the conservative
+    default, so a failed or skipped lookup hides a playable track rather than offering
+    an unplayable one.
 
     Uploads carry neither marker, so they stay available - see
     music-assistant/support#6032, #4108 and #6123.
